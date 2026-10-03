@@ -1,0 +1,623 @@
+#!/usr/bin/env node
+/*
+ * web-designer — CLI for the live design server.
+ *
+ *   start/stop/status/url   lifecycle; the port and pid live in .web-design.json
+ *   poll                    block until the user asks for something, then flush
+ *   wait/flush              lower-level access to the same event queue
+ *   refresh/mode/highlight  drive the open page
+ *   exec                    run JS in the open page and get the value back
+ *   screenshot              render the page or one element, in the page itself
+ *
+ * Zero dependencies. The server is a detached child; this CLI only talks to it
+ * over its localhost control API.
+ */
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+const http = require('http');
+
+const SCRIPTS = __dirname;
+const SERVER = path.join(SCRIPTS, 'server.js');
+const PROJECT = path.resolve(process.env.WEB_DESIGNER_PROJECT || process.cwd());
+const CONFIG_PATH = path.join(PROJECT, '.web-design.json');
+const LOG_DIR = path.join(PROJECT, '.web-design');
+const LOG_PATH = path.join(LOG_DIR, 'server.log');
+
+const die = (msg, code = 1) => {
+  process.stderr.write(`web-designer: ${msg}\n`);
+  process.exit(code);
+};
+
+// `web-designer status | head` closes stdout early; exit quietly instead of throwing.
+process.stdout.on('error', (err) => {
+  if (err.code === 'EPIPE') process.exit(0);
+  throw err;
+});
+
+const out = (s) => process.stdout.write(s.endsWith('\n') ? s : s + '\n');
+const pretty = (obj) => out(JSON.stringify(obj, null, 2));
+
+/* ----------------------------------------------------------------- config */
+
+function readConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function writeConfig(patch) {
+  const next = { ...readConfig(), ...patch };
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2) + '\n');
+  return next;
+}
+
+/* ------------------------------------------------------------- arg parsing */
+
+function parseArgs(argv) {
+  const flags = {};
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--') {
+      positional.push(...argv.slice(i + 1));
+      break;
+    }
+    if (arg.startsWith('--')) {
+      const [key, inline] = arg.slice(2).split(/=(.*)/s);
+      const name = key.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      const next = argv[i + 1];
+      if (inline !== undefined) flags[name] = inline;
+      else if (next !== undefined && !next.startsWith('--')) flags[name] = argv[++i];
+      else flags[name] = true;
+    } else {
+      positional.push(arg);
+    }
+  }
+  return { flags, positional };
+}
+
+/* ----------------------------------------------------------- server status */
+
+function pidAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+  try {
+    const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    // Guard against pid reuse: it must still be *our* server process.
+    if (cmd && !cmd.includes('server.js')) return false;
+  } catch {}
+  return true;
+}
+
+/*
+ * Plain node:http, not fetch: a `poll` can block for half an hour and undici
+ * cuts a response off after 300s, which killed long polls with "fetch failed".
+ */
+function api(route, { method = 'GET', body, timeoutMs = 20000, query } = {}) {
+  const config = readConfig();
+  if (!config.port) return Promise.reject(new Error('no server recorded in .web-design.json — run `web-designer start`'));
+
+  const url = new URL(`http://127.0.0.1:${config.port}/__designer/api/${route}`);
+  for (const [k, v] of Object.entries(query || {})) if (v !== undefined && v !== null) url.searchParams.set(k, v);
+  const payload = body ? JSON.stringify(body) : null;
+
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port: config.port,
+        path: url.pathname + url.search,
+        method,
+        headers: payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {},
+      },
+      (res) => {
+        let data = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => (data += c));
+        res.on('end', () => {
+          try {
+            resolve({ status: res.statusCode, body: JSON.parse(data) });
+          } catch {
+            reject(new Error(`bad response from server: ${data.slice(0, 200)}`));
+          }
+        });
+      },
+    );
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`timed out after ${Math.round(timeoutMs / 1000)}s talking to the server`));
+    });
+    req.on('error', reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+async function status() {
+  const config = readConfig();
+  if (!config.port || !pidAlive(config.pid)) return null;
+  try {
+    const { body } = await api('status', { timeoutMs: 3000 });
+    return body.ok ? body : null;
+  } catch {
+    return null;
+  }
+}
+
+async function requireStatus() {
+  const running = await status();
+  if (!running) die('no server running — start it with `web-designer start`');
+  return running;
+}
+
+/* --------------------------------------------------------------- commands */
+
+async function cmdStart(flags) {
+  const existing = await status();
+  if (existing) {
+    out(`already running — ${existing.rootRelative}/ at http://127.0.0.1:${existing.port}/ (pid ${existing.pid})`);
+    return;
+  }
+
+  const config = readConfig();
+  const root = flags.root || config.root || 'designs';
+  const port = Number(flags.port || config.port || 0);
+  fs.mkdirSync(path.resolve(PROJECT, root), { recursive: true });
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  writeConfig({ root, port: port || null, pid: null });
+
+  const log = fs.openSync(LOG_PATH, 'a');
+  const child = spawn(process.execPath, [SERVER], {
+    cwd: PROJECT,
+    detached: true,
+    stdio: ['ignore', log, log],
+    env: { ...process.env, WEB_DESIGNER_PROJECT: PROJECT, WEB_DESIGNER_PORT: String(port || '') },
+  });
+  child.unref();
+
+  const deadline = Date.now() + 10000;
+  for (;;) {
+    const running = await status();
+    if (running) {
+      out(`serving ${running.rootRelative}/ at http://127.0.0.1:${running.port}/ (pid ${running.pid})`);
+      out(`open that URL in a browser to get the designer toolbar`);
+      if (flags.launch) launchBrowser(`http://127.0.0.1:${running.port}/`);
+      return;
+    }
+    if (Date.now() > deadline) {
+      const tail = fs.existsSync(LOG_PATH) ? fs.readFileSync(LOG_PATH, 'utf8').split('\n').slice(-12).join('\n') : '';
+      die(`server did not come up within 10s\n${tail}`);
+    }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+}
+
+function launchBrowser(url) {
+  try {
+    const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
+    spawn(opener, [url], { detached: true, stdio: 'ignore' }).unref();
+  } catch {
+    /* printing the URL is enough */
+  }
+}
+
+async function cmdStop() {
+  const config = readConfig();
+  const running = await status();
+  if (running) {
+    try {
+      await api('shutdown', { method: 'POST', timeoutMs: 3000 });
+    } catch {}
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  if (pidAlive(config.pid)) {
+    try {
+      process.kill(config.pid, 'SIGTERM');
+    } catch {}
+  }
+  writeConfig({ pid: null, stoppedAt: new Date().toISOString() });
+  out(running ? `stopped (pid ${running.pid}); port ${running.port} remembered for next time` : 'not running');
+}
+
+async function cmdStatus(flags) {
+  const running = await status();
+  if (!running) {
+    const config = readConfig();
+    if (flags.json) return pretty({ running: false, port: config.port || null, root: config.root || 'designs' });
+    out(`not running${config.port ? ` (port ${config.port} remembered)` : ''}`);
+    process.exit(3);
+  }
+  if (flags.json) return pretty({ running: true, ...running });
+
+  out(`running   pid ${running.pid}  http://127.0.0.1:${running.port}/`);
+  out(`root      ${running.root}`);
+  out(`queued    ${running.queued} event(s)`);
+  if (!running.clients.length) out('pages     none connected');
+  for (const c of running.clients) out(`page      ${c.id}  ${c.url}  "${c.title || ''}"`);
+}
+
+function fmtEvent(e) {
+  const at = e.at.slice(11, 19);
+  switch (e.type) {
+    case 'element.selected':
+      return `${at}  element.selected  ${e.selector}  (${e.via || 'click'}, ${e.rect.width}×${e.rect.height})`;
+    case 'text.edited':
+      return `${at}  text.edited       ${e.selector}\n    - ${JSON.stringify(e.oldText)}\n    + ${JSON.stringify(e.newText)}`;
+    case 'element.request':
+      return `${at}  element.request   ${e.selector}  (${e.tag}, ${e.rect.width}×${e.rect.height})\n    → ${e.request}`;
+    case 'text.cancelled':
+      return `${at}  text.cancelled    ${e.selector}`;
+    case 'page.open':
+      return `${at}  page.open         ${e.url}`;
+    case 'page.navigate':
+      return `${at}  page.navigate     ${e.url}`;
+    case 'page.unload':
+      return `${at}  page.unload       ${e.url || ''} (${e.reason})`;
+    case 'mode.changed':
+      return `${at}  mode.changed      ${e.mode}`;
+    case 'page.error':
+      return `${at}  page.error        ${e.message}`;
+    default:
+      return `${at}  ${e.type}  ${JSON.stringify(e)}`;
+  }
+}
+
+async function cmdWait(flags) {
+  await requireStatus();
+  const timeoutMs = Math.round(Number(flags.timeout || 300) * 1000);
+  const types = flags.type ? String(flags.type) : flags.types ? String(flags.types) : '';
+  const { body } = await api('wait', {
+    query: { timeout: timeoutMs, types, peek: flags.peek ? '1' : undefined },
+    timeoutMs: timeoutMs + 5000,
+  });
+  if (!body.ok) {
+    out(JSON.stringify({ timeout: true, waited: timeoutMs / 1000 }));
+    process.exit(2);
+  }
+  if (flags.brief) out(fmtEvent(body.event));
+  else pretty(body.event);
+}
+
+/*
+ * The command to keep running in the background: it comes back only when the
+ * user actually asks for something (a saved text edit, or an element request),
+ * and hands over the whole queue so the surrounding context comes with it.
+ */
+async function cmdPoll(flags) {
+  await requireStatus();
+  const timeoutMs = Math.round(Number(flags.timeout || 1800) * 1000);
+  const triggers = flags.any ? '' : String(flags.trigger || flags.triggers || 'text.edited,element.request');
+
+  const owner = flags.label ? String(flags.label) : `pid ${process.pid}`;
+  const { body } = await api('poll', {
+    query: { triggers, timeout: timeoutMs, owner, share: flags.share ? '1' : undefined },
+    timeoutMs: timeoutMs + 5000,
+  });
+  const events = body.events || [];
+
+  // The server was told to stop while we were waiting. Report it and stay down.
+  if (body.stopped) {
+    if (events.length) {
+      if (flags.brief) events.forEach((e) => out(fmtEvent(e)));
+      else pretty(events);
+    }
+    out(
+      JSON.stringify({
+        stopped: true,
+        message:
+          'the design server was stopped, so this chat is no longer listening. ' +
+          'Run `web-designer start` and poll again when the user wants to continue.',
+      }),
+    );
+    process.exit(8);
+  }
+
+  // Another chat took over listening. Do not restart the poll here: say so and
+  // let the user decide which conversation should be holding the page.
+  if (body.evicted) {
+    out(
+      JSON.stringify({
+        evicted: true,
+        by: body.evicted.by,
+        at: body.evicted.at,
+        message:
+          'another session started polling this design server and is now receiving the requests. ' +
+          'Tell the user this chat has stopped listening, and poll again only when they ask this chat to take over.',
+      }),
+    );
+    process.exit(7);
+  }
+
+  // Only the server can say it timed out. Inferring it from an empty result
+  // once made a real request look like silence — never do that again.
+  if (body.timeout) {
+    if (events.length) {
+      if (flags.brief) events.forEach((e) => out(fmtEvent(e)));
+      else pretty(events);
+      process.stderr.write('  (timed out; these were queued but nothing was requested)\n');
+      return;
+    }
+    out(JSON.stringify({ timeout: true, waited: timeoutMs / 1000 }));
+    process.exit(2);
+  }
+
+  if (!events.length) {
+    // Woken with nothing: the server settled this waiter without a batch.
+    out(JSON.stringify({ woken: true, events: 0, hint: 'check `web-designer log` — an event may have gone elsewhere' }));
+    process.exit(4);
+  }
+  if (flags.brief) events.forEach((e) => out(fmtEvent(e)));
+  else pretty(events);
+}
+
+async function cmdLog(flags) {
+  await requireStatus();
+  const { body } = await api('history', { query: { limit: Number(flags.limit || 50) } });
+  const events = body.events || [];
+  if (!events.length) return out('no events recorded yet');
+  if (flags.brief) events.forEach((e) => out(fmtEvent(e)));
+  else pretty(events);
+}
+
+async function cmdFlush(flags) {
+  await requireStatus();
+  const { body } = await api('flush', { method: 'POST' });
+  if (!body.events.length) {
+    if (!flags.brief) out('[]');
+    else out('no events queued');
+    return;
+  }
+  if (flags.brief) body.events.forEach((e) => out(fmtEvent(e)));
+  else pretty(body.events);
+}
+
+async function cmdWorking(positional, flags) {
+  await requireStatus();
+  const note = positional.join(' ') || flags.note || null;
+  const { body } = await api('working', { method: 'POST', body: { note } });
+  out(`status: working${body.note ? ` — ${body.note}` : ''}`);
+}
+
+async function cmdDone() {
+  await requireStatus();
+  const { body } = await api('done', { method: 'POST', body: {} });
+  out(`status: ${body.listening ? 'listening' : 'idle'}`);
+}
+
+async function cmdRefresh() {
+  await requireStatus();
+  const { body } = await api('refresh', { method: 'POST' });
+  if (!body.ok) die('no page connected — open the design in a browser first', 4);
+  out(`refresh sent to ${body.refreshed} page(s) — each reloads once its user is idle`);
+}
+
+async function cmdMode(positional) {
+  const mode = positional[0] || 'off';
+  if (!['off', 'element', 'text'].includes(mode)) die('mode must be one of: off, element, text');
+  await requireStatus();
+  const { body } = await api('mode', { method: 'POST', body: { mode } });
+  if (!body.ok) die('no page connected', 4);
+  out(`mode ${mode} on ${body.clients} page(s)`);
+}
+
+async function cmdHighlight(positional, flags) {
+  const selector = positional[0];
+  if (!selector) die('usage: web-designer highlight <css-selector>');
+  await requireStatus();
+  const { body } = await api('highlight', {
+    method: 'POST',
+    body: { selector, duration: Number(flags.duration || 2500), clientId: flags.client },
+  });
+  if (!body.ok) die(body.error || 'highlight failed', 4);
+  out(`highlighted ${selector}`);
+}
+
+async function cmdExec(positional, flags) {
+  let code = positional.join(' ');
+  if (!code || code === '-') code = fs.readFileSync(0, 'utf8');
+  if (!code.trim()) die('usage: web-designer exec "<js>"   (or - to read stdin)');
+  await requireStatus();
+  const timeoutMs = Math.round(Number(flags.timeout || 30) * 1000);
+  const { body } = await api('exec', {
+    method: 'POST',
+    body: { code, timeout: timeoutMs, clientId: flags.client },
+    timeoutMs: timeoutMs + 5000,
+  });
+  if (!body.ok) die(body.error || 'exec failed', 4);
+  pretty(body.value === undefined ? null : body.value);
+}
+
+/* ------------------------------------------------------------- screenshots */
+
+function agentDir() {
+  if (process.env.WEB_DESIGNER_AGENT_DIR) return process.env.WEB_DESIGNER_AGENT_DIR;
+  if (process.env.CLAUDE_SCRATCHPAD_DIR) return process.env.CLAUDE_SCRATCHPAD_DIR;
+
+  // Claude Code's per-session scratchpad: /tmp/claude-<uid>/<project-slug>/<session>/scratchpad
+  const slug = PROJECT.replace(/\//g, '-');
+  const base = path.join(os.tmpdir(), `claude-${typeof process.getuid === 'function' ? process.getuid() : ''}`, slug);
+  try {
+    const sessions = fs
+      .readdirSync(base, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => path.join(base, d.name, 'scratchpad'))
+      .filter((p) => fs.existsSync(p))
+      .map((p) => ({ p, mtime: fs.statSync(p).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    if (sessions.length) return sessions[0].p;
+  } catch {}
+  return path.join(LOG_DIR, 'shots');
+}
+
+function shotPath(flags) {
+  if (flags.out) return path.resolve(PROJECT, flags.out);
+
+  const audience = flags.for || 'agent';
+  if (!['agent', 'user'].includes(audience)) die('--for must be agent or user');
+  const dir = audience === 'user' ? path.join(PROJECT, readConfig().screenshotDir || 'screenshots') : agentDir();
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const base =
+    (flags.name && String(flags.name).replace(/\.png$/i, '')) ||
+    (flags.selector ? String(flags.selector).replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').slice(0, 40) : 'page');
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, `${base}-${stamp}.png`);
+}
+
+async function cmdScreenshot(positional, flags) {
+  const running = await requireStatus();
+  if (!running.clients.length) {
+    die(
+      'no page connected — screenshots are rendered by the live page.\n' +
+        `  open http://127.0.0.1:${running.port}/ in a browser (or via the claude-in-chrome MCP tools) and retry`,
+      4,
+    );
+  }
+  const selector = flags.selector || positional[0] || null;
+  const file = shotPath({ ...flags, selector });
+
+  const { body } = await api('screenshot', {
+    method: 'POST',
+    body: {
+      clientId: flags.client,
+      selector,
+      full: !selector || !!flags.full,
+      scale: Number(flags.scale || 1),
+      padding: Number(flags.padding || 0),
+      allowSvgFallback: !!flags.allowSvgFallback,
+      timeout: Math.round(Number(flags.timeout || 60) * 1000),
+    },
+    timeoutMs: Math.round(Number(flags.timeout || 60) * 1000) + 5000,
+  });
+
+  if (!body.ok) die(body.error || 'screenshot failed', 5);
+  const base64 = String(body.dataUrl).replace(/^data:image\/png;base64,/, '');
+  fs.writeFileSync(file, Buffer.from(base64, 'base64'));
+  out(file);
+  process.stderr.write(`  ${body.width}×${body.height}px via ${body.method}${selector ? ` of ${selector}` : ' (full page)'}\n`);
+}
+
+async function cmdUrl() {
+  const running = await status();
+  const config = readConfig();
+  if (running) return out(`http://127.0.0.1:${running.port}/`);
+  if (config.port) return out(`http://127.0.0.1:${config.port}/ (not running)`);
+  die('no server configured — run `web-designer start`');
+}
+
+async function cmdOpen(positional, flags) {
+  const running = await requireStatus();
+  const url = `http://127.0.0.1:${running.port}/${(positional[0] || '').replace(/^\//, '')}`;
+  if (flags.launch) launchBrowser(url);
+  out(url);
+}
+
+function usage() {
+  out(`web-designer — live design server with an in-page selection toolbar
+
+  start [--root DIR] [--port N] [--launch]   start (reuses the remembered port)
+  stop | restart | status [--json]           lifecycle
+  url | open [path] [--launch]               print the URL to open
+
+  poll [--timeout S] [--brief] [--trigger T[,T]] [--any] [--share] [--label L]
+                                             block until the user REQUESTS something
+                                             (text.edited, element.request), then print
+                                             the whole queue and exit — run this in the
+                                             background and answer whatever comes back.
+                                             Starting a poll evicts the poll running in any
+                                             other chat (exit 7 there) unless --share
+  wait [--type T[,T]] [--timeout S] [--brief] [--peek]
+                                             lower level: block for one matching event
+  flush [--brief]                            drain everything queued so far
+  log [--limit N] [--brief]                  replay recent events WITHOUT consuming them
+  working [note]                             show the page a spinner: you are on it
+  done                                       clear it when the change is in
+  refresh                                    reload every open page (deferred
+                                             while the user is mid-gesture)
+  mode <off|element|text>                    drive the toolbar remotely
+  highlight <selector> [--duration ms]       flash an element in the page
+  exec "<js>" [--timeout S]                  run JS in the page, print the result
+
+  screenshot [selector] [--selector S] [--full] [--for agent|user]
+             [--name N] [--out PATH] [--scale N] [--padding N]
+             [--allow-svg-fallback]          render in-page; prints the file path
+
+  --client ID on exec/screenshot/highlight picks one of the pages listed by status
+  (default: the most recently connected one)
+
+Events: requests  element.request, text.edited      (these end a poll)
+        context   element.selected, page.open, page.navigate, page.unload,
+                  text.cancelled, mode.changed, page.error
+
+Exit codes: 2 wait timed out · 3 not running · 4 no page connected · 5 capture failed`);
+}
+
+/* ------------------------------------------------------------------- main */
+
+(async function main() {
+  const [, , command, ...rest] = process.argv;
+  const { flags, positional } = parseArgs(rest);
+
+  try {
+    switch (command) {
+      case 'start':
+        return await cmdStart(flags);
+      case 'stop':
+        return await cmdStop();
+      case 'restart':
+        await cmdStop();
+        return await cmdStart(flags);
+      case 'status':
+        return await cmdStatus(flags);
+      case 'url':
+        return await cmdUrl();
+      case 'open':
+        return await cmdOpen(positional, flags);
+      case 'poll':
+        return await cmdPoll(flags);
+      case 'wait':
+        return await cmdWait(flags);
+      case 'flush':
+        return await cmdFlush(flags);
+      case 'log':
+        return await cmdLog(flags);
+      case 'working':
+        return await cmdWorking(positional, flags);
+      case 'done':
+        return await cmdDone();
+      case 'refresh':
+        return await cmdRefresh();
+      case 'mode':
+        return await cmdMode(positional);
+      case 'highlight':
+        return await cmdHighlight(positional, flags);
+      case 'exec':
+        return await cmdExec(positional, flags);
+      case 'screenshot':
+      case 'shot':
+        return await cmdScreenshot(positional, flags);
+      case 'help':
+      case '--help':
+      case '-h':
+      case undefined:
+        return usage();
+      default:
+        die(`unknown command: ${command}\nrun \`web-designer help\``);
+    }
+  } catch (err) {
+    if (err && err.name === 'TimeoutError') die('timed out talking to the server');
+    if (err && (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED')) {
+      die('the design server closed the connection — it was probably stopped; `web-designer start` brings it back', 8);
+    }
+    die((err && err.message) || String(err));
+  }
+})();

@@ -1,0 +1,14 @@
+{
+  "name": "alancnet",
+  "owner": { "name": "Alan Colón" },
+  "metadata": { "description": "Claude Code plugins by Alan Colón" },
+  "plugins": [
+    {
+      "name": "web-designer",
+      "source": "./plugins/web-designer",
+      "description": "Point-and-edit HTML design sessions: click an element in the browser and Claude knows exactly what you mean.",
+      "version": "1.0.0",
+      "category": "design"
+    }
+  ]
+}
