@@ -1,21 +1,21 @@
 ---
-name: web-designer
-description: Serve HTML designs on a local server with an in-page overlay toolbar so the user can point at elements and rewrite text directly in the browser, and Claude can read those picks, edit the files, refresh the page, and take screenshots. Use whenever iterating on HTML/CSS design files with a person watching — "show me this in the browser", "let me pick the element", "which one do you mean", "change that heading", "refresh so I can see it", "screenshot this section".
+name: open
+description: Open an HTML/CSS design in the user's browser with a live overlay toolbar, then listen while they click the element they mean or rewrite text in place — Claude edits the files, refreshes the page, and keeps listening. Use whenever iterating on HTML/CSS design files with a person watching — "show me this in the browser", "open the design", "let me point at it", "change that heading", "refresh so I can see it".
 ---
 
-# web-designer — design with the user pointing at the page
+# design:open — design with the user pointing at the page
 
 The user opens the design in their own browser. A floating toolbar (Next.js dev-overlay
 style) lets them **click the element they mean** or **rewrite text in place**. Every pick
 arrives here as an event, so "make *this* bigger" stops being ambiguous.
 
 ```bash
-WD=<this skill's base directory>/scripts/web-designer   # use the absolute path
+WD=<this skill's base directory>/../../scripts/web-designer   # resolve to an absolute path
 ```
 
-Set `WD` to the `scripts/web-designer` file next to this SKILL.md (the skill's base
-directory is given when the skill loads). Run it from the project root — that's where
-`.web-design.json` is read and written.
+The CLI lives in the plugin's `scripts/` folder, two levels up from this SKILL.md (the
+skill's base directory is given when the skill loads). Run it from the project root — that
+is where `.web-design.json` is read and written.
 
 Zero dependencies (Node only). State lives in `.web-design.json` at the project root:
 the root directory to serve, the port (reused across sessions), and the running pid.
@@ -189,58 +189,24 @@ dropped socket as an unload.
   ✅ (or Enter) keeps it and sends `text.edited`. Either way the edit ends.
 - Esc leaves a mode. The toolbar is draggable and remembers where it was put.
 
-## Driving the page
+## Related skills
+
+The same server and page back the rest of the plugin:
+
+| skill | for |
+|---|---|
+| `/design:resume` | start listening again after a pause, or take over from another chat |
+| `/design:pick` | ask the user to point at one element mid-conversation |
+| `/design:inspect` | highlight an element, read computed styles, run JS in the live page |
+| `/design:screenshot` | capture the page or one element, for you or for the user |
+| `/design:stop` | stop listening and/or shut the server down |
+
+Quick reference while in the loop:
 
 ```bash
-$WD highlight '.card:nth-of-type(2)'   # scroll to it and flash it — "this one?"
-$WD exec "return getComputedStyle(document.querySelector('h1')).fontSize"
-$WD refresh
-```
-
-`exec` runs JS in the live page (top-level `return`, `await` allowed) and prints the JSON
-result — good for reading computed styles, measuring, or checking state after an edit.
-
-**`refresh` is polite.** The page holds the reload until the user is still — no button
-down, no text selected, no request box or text edit open, and a full second since they last
-moved the mouse or typed. Already idle means it reloads at once. So `refresh` returns
-before the reload necessarily happens: if you need the *new* page (a screenshot, an `exec`
-that reads the result of your edit), give it a moment, or check with `exec` first.
-
-## Screenshots
-
-Rendered **by the page itself** through HTML-in-Canvas, so what you get is exactly what the
-user sees — no headless browser, no second render of the page.
-
-```bash
-$WD screenshot                          # whole page → your scratchpad; prints the path
-$WD screenshot --selector '.hero'       # one element
-$WD screenshot --for user --name hero   # → screenshots/ in the project, for the user
-```
-
-- `--for agent` (default) writes to this session's scratchpad — for **you** to `Read`.
-- `--for user` writes to `screenshots/` — for the **user** to open or keep.
-- Also: `--full`, `--scale N`, `--padding N`, `--out PATH`, `--client ID`.
-
-Two requirements, both reported clearly when unmet:
-
-1. **The flag.** Chrome ships the API off. Turn on `chrome://flags/#canvas-draw-element`
-   and restart, launch with `--enable-blink-features=CanvasDrawElement`, or (on Linux) put
-   that flag in `~/.config/chrome-flags.conf`. The hostname is irrelevant — `127.0.0.1` and
-   `localhost` are both secure contexts.
-2. **A foreground tab.** The capture works by cloning the target into a `layoutsubtree`
-   canvas and drawing it once painted, and a background tab never paints. Content below the
-   fold is fine — the whole cloned subtree paints, however tall it is.
-
-Without the flag, either use the `claude-in-chrome` screenshot tool or pass
-`--allow-svg-fallback` for an approximate `<foreignObject>` render (same-origin CSS and
-custom properties carry over; cross-origin images and fonts may not).
-
-## Everything else
-
-```
-$WD stop | restart | url | open [path]    # print links; let the user click them
-$WD working [note] | done                 # drive the toolbar's status light
-$WD log [--limit N]                       # replay events without consuming them
+$WD refresh                          # polite reload: waits until the user is idle
+$WD highlight '.card:nth-of-type(2)' # flash an element — "this one?"
+$WD screenshot                       # see what they see
 ```
 
 Exit codes: `2` timed out · `3` not running · `4` no page connected / poll woken empty ·

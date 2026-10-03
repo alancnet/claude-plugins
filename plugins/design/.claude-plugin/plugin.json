@@ -1,0 +1,19 @@
+{
+  "name": "design",
+  "version": "2.0.0",
+  "description": "Design HTML/CSS with Claude in a live browser page: point at elements or rewrite text in place, and Claude edits the files, refreshes, inspects, and screenshots.",
+  "author": {
+    "name": "Alan Colón"
+  },
+  "homepage": "https://github.com/alancnet/claude-plugins",
+  "repository": "https://github.com/alancnet/claude-plugins",
+  "license": "MIT",
+  "keywords": [
+    "design",
+    "html",
+    "css",
+    "browser",
+    "overlay",
+    "screenshot"
+  ]
+}
